@@ -1,0 +1,641 @@
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <math.h>
+
+constexpr char WIFI_SSID[] = "Pooh";
+int32_t getWiFiChannel(const char *ssid) {
+
+    if (int32_t n = WiFi.scanNetworks()) {
+        for (uint8_t i=0; i<n; i++) {
+            if (!strcmp(ssid, WiFi.SSID(i).c_str())) {
+                return WiFi.channel(i);
+            }
+        }
+    }
+
+    return 0;
+}
+
+// Replace the next variables with your SSID/Password combination
+const char* ssid = "Pooh";
+const char* password = "12131415";
+
+// Add your MQTT Broker IP address, example:
+const char* mqtt_server = "192.168.137.1";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+long lastMsg = 0;
+char msg[50];
+int value = 0;
+
+// แก้ไขค่า mac ตัวที่ต้องการส่งไปหา
+ uint8_t AddressPlayer1[] = {0xE8, 0x68, 0xE7, 0x22, 0xB6, 0xA8};//ส่งไปหาเฉพาะ mac address
+ uint8_t AddressPlayer2[] = {0x24, 0x0A, 0xC4, 0x9F, 0x50, 0xC0};//ส่งไปหาเฉพาะ mac address
+ uint8_t AddressPlayer3[] = {0x4C, 0x11, 0xAE, 0xD3, 0xED, 0x28};//ส่งไปหาเฉพาะ mac address
+ uint8_t AddressPlayer4[] = {0x24, 0x0A, 0xC4, 0x9F, 0x20, 0x1C};//ส่งไปหาเฉพาะ mac address
+ uint8_t AddressPlayer5[] = {0xE8, 0x68, 0xE7, 0x22, 0xC1, 0x70};//ส่งไปหาเฉพาะ mac address
+
+//Global variable
+char server_state = 'M'; 	                        //เก็บสถานะserver
+int rounds = 1; 			                            //เก็บจำนวนรอบที่เล่น
+char player_active[5] = {'0','0','0','0','0'} ;	  //เก็บสถานะของผู้เล่นแต่ละคน (‘0’ แพ้เกม, ‘1’ กำลังเล่น)
+int player_score[5] = {0,0,0,0,0};		            //เก็บคะแนนผู้เล่นแต่ละคน (-10 ถึง 0)
+int player_input[5] = {-1,-1,-1,-1,-1};		        //เก็บตัวเลขที่ส่งเขามาของผู้เล่นแต่ละคน (0 ถึง 100)
+char w_round[5] = {'0','0','0','0','0'};		      //เก็บสถานะแพ้ชนะในแต่ละรอบของผู้เล่นแต่ละคน (‘0’ แพ้ในรอบนั้น, ‘1’ ชนะในรอบนั้น)
+char w_game;		                                  //เก็บคนที่ชนะเกม
+long unsigned time_round;                         //เก็บเวลาที่เหลือในแต่ละรอบ
+int sendingmode=0;
+String sp = " ";
+int result;
+float result2d;
+int penalty = 1;
+String dataString;
+int gamestart = 0;
+char tempString[100];
+
+//GPIO
+const int ledPin = 2;
+const int buttonPin = 13;
+
+//โครงสร้างข้อมูลที่จะส่ง
+typedef struct struct_message { // สร้างตัวแปรแพ็จเกจแบบ struct
+  char m_request;
+  char m_server_state;
+  char m_rounds;
+  char m_player_active[5] = {'0','0','0','0','0'};
+  int m_player_score[5] = {0,0,0,0,0};
+  char m_w_round[5] = {'0','0','0','0','0'};
+  char w_game;
+  long unsigned m_time_round;
+  int m_input;
+  int m_playerID;
+} struct_message;
+
+struct_message myData; // ตัวแปรแพ็คเกจที่ต้องการส่ง
+
+void sendtoMQTT1(){
+  dataString = "{\"WA\":[";
+  for(int i=0;i<5;i++){
+    dataString += w_round[i];
+    if(i!=4){
+      dataString += ",";
+    }
+  }
+  dataString += "],\"S\":[";
+  for(int i=0;i<5;i++){
+    dataString += player_score[i];
+    if(i!=4){
+      dataString += ",";
+    }
+  }
+  dataString += "],\"Avg\":";
+  dataString += result2d;
+  dataString += ",\"Sm\":null,\"C\":null,\"G\":null";
+  dataString += "}";
+  dataString.toCharArray(tempString,100);
+  Serial.print("MQTT sending : ");
+  Serial.println(tempString);
+  client.publish("esp32/BalanceScale", tempString);
+}
+
+void sendtoMQTT2(){
+  dataString  = "{\"Sm\":[";
+  for(int i=0;i<5;i++){
+    dataString += player_input[i];
+    if(i!=4){
+      dataString += ",";
+    }
+  }
+  dataString += "],\"WA\":null,\"S\":null,\"Avg\":null,\"C\":null,\"G\":null";
+  dataString += "}";
+  dataString.toCharArray(tempString,100);
+  Serial.print("MQTT sending : ");
+  Serial.println(tempString);
+  client.publish("esp32/BalanceScale", tempString);
+  client.endPublish();
+}
+
+void sendtoMQTT3(){
+  dataString = "{\"C\":[";
+  for(int i=0;i<5;i++){
+    dataString += player_active[i];
+    if(i!=4){
+      dataString += ",";
+    }
+  }
+  dataString += "],\"WA\":null,\"S\":null,\"Avg\":null,\"Sm\":null,\"G\":null";
+  dataString += "}";
+  dataString.toCharArray(tempString,100);
+  Serial.print("MQTT sending : ");
+  Serial.println(tempString);
+  client.publish("esp32/BalanceScale", tempString);
+}
+
+void sendtoMQTT4(){
+  dataString = "{\"G\":1,\"WA\":null,\"S\":null,\"Avg\":null,\"Sm\":null,\"C\":null}";
+  dataString.toCharArray(tempString,100);
+  Serial.print("MQTT sending : ");
+  Serial.println(tempString);
+  client.publish("esp32/BalanceScale", tempString);
+}
+
+void calculate_winner(){
+  int count = 0;
+  result = 0;
+  for(int i=0;i<5;i++){
+    if(player_input[i]!=-1){
+      count++;
+      result += player_input[i];
+    }
+    if(player_input[i]==-1){
+      w_round[i]='0';
+    }
+  }
+  if(count==0){
+    for(int i=0;i<5;i++){
+      w_round[i] = '0';
+    }
+    result2d = 0.00;
+  }else{
+    result2d = (int)(((result/count)*0.8)*100)/100.0;
+    result = (result/count)*0.8+0.5;
+    int min = 101;
+    int pos = 0;
+    for(int i = 0;i<5;i++){
+      int absDis = abs(player_input[i]-result);
+      if(w_round[i]=='1' && absDis>min){
+        w_round[i] = '0';
+      }
+      if(w_round[i]=='1' && absDis<min){
+        pos = i;
+        min = absDis;
+      }
+    }
+    for(int i =0;i<pos;i++){
+      w_round[i] = '0';
+    }
+  }
+}
+
+//ฟังก์ชั่นเรียกใช้ตอนส่งข้อมูล
+void send_data(){
+  myData.m_server_state = server_state;
+  for(int i=0;i<5;i++){
+    myData.m_player_active[i] = player_active[i];
+  }
+  if(server_state=='S'){
+    for(int i = 0;i<5;i++){
+      myData.m_player_score[i] = player_score[i];
+    }
+  }else if(server_state=='5' || server_state=='4' || server_state=='3' || server_state=='2'){
+    myData.m_server_state = 'I';
+    myData.m_rounds = rounds;
+    myData.m_time_round = 30000 - (millis() - time_round);
+  }else if(server_state=='W'){
+    for(int i = 0;i<5;i++){
+      myData.m_w_round[i] = w_round[i];
+    }
+  }else if(server_state=='L'){
+    for(int i = 0;i<5;i++){
+      myData.m_player_score[i] = player_score[i];
+    }
+  }
+  esp_err_t result;
+  switch(sendingmode){
+    case 0 :
+      result = esp_now_send(0, (uint8_t *) &myData, sizeof(myData));
+      break;
+    case 1 :
+      result = esp_now_send(AddressPlayer1, (uint8_t *) &myData, sizeof(myData));
+      break;
+    case 2 :
+      result = esp_now_send(AddressPlayer2, (uint8_t *) &myData, sizeof(myData));
+      break;
+    case 3 :
+      result = esp_now_send(AddressPlayer3, (uint8_t *) &myData, sizeof(myData));
+      break;
+    case 4 :
+      result = esp_now_send(AddressPlayer4, (uint8_t *) &myData, sizeof(myData));
+      break;
+    case 5 :
+      result = esp_now_send(AddressPlayer5, (uint8_t *) &myData, sizeof(myData));
+      break;
+  }
+  if (result == ESP_OK) {
+    Serial.println("Sent with success");
+  }
+  else {
+    Serial.println("Error sending the data");
+  }
+}
+
+//เมื่อส่งข้อมูลมาทำฟังก์ชั่นนี้
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("\r\nLast Packet Send Status:\t");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
+}
+
+// เมื่อรับข้อมูลมา ให้ทำในฟังก์ชั่นนี้
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+  memcpy(&myData, incomingData, sizeof(myData));
+  Serial.print("receive Data : ");
+  Serial.println(myData.m_request);
+  if(myData.m_request == 'A' && (server_state=='5' || server_state=='4' || server_state=='3' || server_state=='2')){
+    player_input[myData.m_playerID] = myData.m_input;
+    sendtoMQTT2();
+  }
+  if(myData.m_request == 'C'){
+    sendingmode = myData.m_playerID+1;
+    send_data();
+  }
+  if(myData.m_request == 'D'){
+    player_active[myData.m_playerID] = '1';
+    sendtoMQTT3();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  //ตั้งเป็นโหมด Wi-Fi Station
+  WiFi.mode(WIFI_AP_STA);
+
+  int32_t channel = getWiFiChannel(WIFI_SSID);
+  // WiFi.printDiag(Serial);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+  // WiFi.printDiag(Serial);
+
+  //start mqtt
+  setup_wifi();
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
+  client.setKeepAlive(6000000);
+
+  // สั่งให้เริ่ม ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+
+  // เมื่อรับข้อมูลมา ให้ทำในฟังก์ชั่น OnDataRecv ที่เราสร้างไว้
+  esp_now_register_recv_cb(OnDataRecv);
+
+  //เมื่อส่งให้ทำฟังก์ชั่น OnDataSend ที่เราสร้างขึ้น
+  esp_now_register_send_cb(OnDataSent);
+
+  esp_now_peer_info_t peerInfo;
+  peerInfo.channel = ESP_IF_WIFI_STA;
+  peerInfo.encrypt = false;
+
+  // เชื่อมต่ออุปกรณ์ที่ต้องการสื่อสาร
+  memcpy(peerInfo.peer_addr, AddressPlayer1, 6); // อุปกรณ์ตัวที่ 1
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer");
+    return;
+  }
+
+  memcpy(peerInfo.peer_addr, AddressPlayer2, 6); // อุปกรณ์ตัวที่ 2
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer");
+    return;
+  }
+
+  memcpy(peerInfo.peer_addr, AddressPlayer3, 6); // อุปกรณ์ตัวที่ 2
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer");
+    return;
+  }
+
+  memcpy(peerInfo.peer_addr, AddressPlayer4, 6); // อุปกรณ์ตัวที่ 2
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer");
+    return;
+  }
+
+  memcpy(peerInfo.peer_addr, AddressPlayer5, 6); // อุปกรณ์ตัวที่ 2
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer");
+    return;
+  }
+
+  pinMode(ledPin,OUTPUT); // Set the LED Pin as an output
+  pinMode(buttonPin,INPUT_PULLUP); // Set the Tilt Switch as an input
+}
+
+//mqtt
+void setup_wifi() {
+  delay(10);
+  // We start by connecting to a WiFi network
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+//mqtt
+void callback(char* topic, byte* message, unsigned int length) {
+  Serial.print("Message arrived on topic: ");
+  Serial.print(topic);
+  Serial.print(". Message: ");
+  String messageTemp;
+  
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)message[i]);
+    messageTemp += (char)message[i];
+  }
+  Serial.println();
+}
+
+//mqtt
+void reconnect() {
+  // Loop until we're reconnected
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    // Attempt to connect
+    if (client.connect("ESP32Client")) {
+      Serial.println("connected");
+      // Subscribe
+      client.subscribe("esp32/output");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      // Wait 5 seconds before retrying
+      delay(5000);
+    }
+  }
+}
+
+void Main_state(){
+  Serial.println("Now Main_state");
+  while(1){
+    int digitalVal = digitalRead(buttonPin);
+    if(digitalVal == LOW){
+      break;
+    }
+  }
+  sendtoMQTT4();
+  //endstate
+  for(int i=0;i<5;i++){
+    if(player_active[i]=='0'){
+      player_score[i] = -10;
+    }else{
+      player_score[i] = 0;
+    }
+  }
+  server_state = 'S';
+  rounds = 1;
+  //update
+  sendingmode = 0;
+  send_data();
+}
+
+void DisplayScore_state(){
+  Serial.println("Now DisplayScore_state");
+  Serial.print("show player_score : ");
+  String y = player_score[0] + sp + player_score[1] + sp + player_score[2] + sp + player_score[3] + sp + player_score[4];
+  Serial.println(y);
+  delay(4000);
+
+  //endstate
+  int c = 0;
+  for(int i=0;i<5;i++){
+    if(player_active[i]=='1'){
+      c++;
+    }
+  }
+  switch (c) {
+  case 0:
+    server_state = 'G';
+    break;
+  case 1:
+    server_state = 'G';
+    break;
+  case 2:
+    server_state = '2';
+    break;
+  case 3:
+    server_state = '3';
+    break;
+  case 4:
+    server_state = '4';
+    break;
+  case 5:
+    server_state = '5';
+    break;
+  }
+  time_round = millis();
+  for(int i=0;i<5;i++){
+    player_input[i] = -1;
+  }
+  sendtoMQTT2();
+  //update
+  sendingmode = 0;
+  send_data();
+}
+
+void FivePlayer_state(){
+  Serial.println("Now FivePlayer_state");
+  while(millis() - time_round <= 30000){
+  }
+  //endstate
+  //Rule 5 players
+  for(int i=0;i<5;i++){
+    w_round[i] = '1';
+  }
+  calculate_winner();
+  server_state = 'W';
+  //update
+  sendingmode = 0;
+  send_data();
+}
+
+void FourPlayer_state(){
+  Serial.println("Now FourPlayer_state");
+  while(millis() - time_round <= 30000){
+  }
+  //endstate
+  //Rule 4 players
+  for(int i=0;i<5;i++){
+    w_round[i] = '1';
+    for(int j=0;j<5;j++){
+      if(player_input[i]==player_input[j] && i != j){
+        w_round[i] = '0';
+        break;
+      }
+    }
+  }
+  calculate_winner();
+  server_state = 'W';
+  //update
+  sendingmode = 0;
+  send_data();
+}
+
+void ThreePlayer_state(){
+  Serial.println("Now ThreePlayer_state");
+  while(millis() - time_round <= 30000){
+  }
+  //endstate
+  //Rule 3 players
+  for(int i=0;i<5;i++){
+    w_round[i] = '1';
+  }
+  calculate_winner();
+  for(int i=0;i<5;i++){
+    if(player_input[i]==result){
+      penalty = 2;
+      break;
+    }
+  }
+  server_state = 'W';
+  //update
+  sendingmode = 0;
+  send_data();
+}
+
+void TwoPlayer_state(){
+  Serial.println("Now TwoPlayer_state");
+  while(millis() - time_round <= 30000){
+  }
+  //endstate
+  char zero = '0';
+  char hundred = '0';
+  for(int i=0;i<5;i++){
+    w_round[i] = '1';
+    if(player_input[i]==100){
+      hundred = '1';
+    }
+    if(player_input[i]==0){
+      zero = '1';
+    }
+  }
+  if(zero=='1' && hundred=='1'){
+    for(int i=0;i<5;i++){
+      if(player_input[i] != 100){
+        w_round[i] = '0';
+      }
+    }
+  }else{
+    calculate_winner();
+  }
+  server_state = 'W';
+  //update
+  sendingmode = 0;
+  send_data();
+}
+
+void DisplayWinnerRound_state(){
+  Serial.println("Now DisplayWinnerRound_state");
+  Serial.print("show player_input : ");
+  String y = player_input[0] + sp + player_input[1] + sp + player_input[2] + sp + player_input[3] + sp + player_input[4];
+  Serial.println(y);
+  Serial.print("show w_round : ");
+  y = w_round[0] + sp + w_round[1] + sp + w_round[2] + sp + w_round[3] + sp + w_round[4];
+  Serial.println(y);
+  for(int i=0;i<5;i++){
+    if(w_round[i]=='0'){
+      player_score[i] -= penalty;
+      if(player_score[i]<-10){player_score[i]=-10;}
+    }
+  }
+  sendtoMQTT1();
+  delay(16000);
+  //endstate
+  penalty = 1;
+  for(int i=0;i<5;i++){
+    if(player_score[i]==-10 && player_active[i]=='1'){
+      server_state = 'L';
+    }
+  }
+  if(server_state == 'W'){server_state = 'S';}
+  rounds += 1;
+  //update
+  sendingmode = 0;
+  send_data();
+}
+
+void DisplayLoserGame_state(){
+  Serial.println("Now DisplayLoserGame_state");
+  delay(8000);
+  //endstate
+  for(int i=0;i<5;i++){
+    if(player_score[i]==-10){
+      player_active[i]='0';
+      Serial.print("Loser : ");
+      Serial.println(i);
+    }
+  }
+  server_state = 'R';
+  //update
+  sendingmode = 0;
+  send_data();
+}
+
+void DisplayRule_state(){
+  Serial.println("Now DisplayRule_state");
+  delay(8000);
+  //endstate
+  server_state = 'S';
+  //update
+  sendingmode = 0;
+  send_data();
+}
+
+void DisplayWinnerGame_state(){
+  Serial.println("Now DisplayWinnerGame_state");
+  Serial.print("player_active : ");
+  String y = player_active[0] + sp + player_active[1] + sp + player_active[2] + sp + player_active[3] + sp + player_active[4];
+  Serial.println(y);
+  delay(8000);
+  //endstate
+  for(int i=0;i<5;i++){
+    player_active[i] = '0';
+  }
+  server_state = 'M';
+}
+
+void loop() {
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+  if (server_state == 'M'){
+    Main_state();
+  }else if (server_state == 'S'){
+    DisplayScore_state();
+  }else if (server_state == 'G'){
+    DisplayWinnerGame_state();
+  }else if (server_state == '2'){
+    TwoPlayer_state();
+  }else if (server_state == '3'){
+    ThreePlayer_state();
+  }else if (server_state == '4'){
+    FourPlayer_state();
+  }else if (server_state == '5'){
+    FivePlayer_state();
+  }else if (server_state == 'R'){
+    DisplayRule_state();
+  }else if (server_state == 'L'){
+    DisplayLoserGame_state();
+  }else if (server_state == 'W'){
+    DisplayWinnerRound_state();
+  }
+}
